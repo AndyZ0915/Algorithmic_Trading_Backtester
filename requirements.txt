@@ -1,0 +1,44 @@
+# Production Requirements - Trading Backtester
+# Python 3.9+
+
+# Web Framework
+streamlit==1.31.0
+
+# Data Processing
+pandas==2.1.4
+numpy==1.26.2
+
+# Visualization
+plotly==5.18.0
+
+# Data Fetching (with fallback)
+yfinance==0.2.33
+requests==2.31.0
+
+# Database
+sqlalchemy==2.0.23
+
+# Utilities
+python-dateutil==2.8.2
+pytz==2023.3
+
+# Statistical Analysis
+scipy==1.11.4
+
+# Testing
+pytest==7.4.3
+pytest-cov==4.1.0
+
+# Code Quality
+black==23.12.1
+flake8==6.1.0
+mypy==1.7.1
+
+# Performance
+numba==0.58.1
+
+# Optional: Email alerts
+# python-dotenv==1.0.0
+# sendgrid==6.11.0
+
+matplotlib~=3.10.8
