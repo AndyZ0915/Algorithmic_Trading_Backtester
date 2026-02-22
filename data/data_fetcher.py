@@ -1,6 +1,6 @@
 """
-Data fetcher with demo data fallback - PRODUCTION VERSION
-Handles Yahoo Finance with graceful degradation to simulated data
+Handles fetching stock data from Yahoo Finance.
+Falls back to simulated data if Yahoo is down/blocking.
 """
 
 import pandas as pd
@@ -12,57 +12,32 @@ import logging
 import config
 from .database import DatabaseManager
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class DataFetcher:
-    """Fetches stock data with automatic fallback to demo data"""
+    """Fetches stock data with automatic fallback to demo data."""
     
-    def __init__(self, cache_enabled: bool = True, force_demo: bool = False):
-        """
-        Initialize data fetcher.
-        
-        Args:
-            cache_enabled: Enable SQLite caching
-            force_demo: Force use of demo data (skip Yahoo Finance)
-        """
+    def __init__(self, cache_enabled=True, force_demo=False):
         self.cache_enabled = cache_enabled
         self.force_demo = force_demo
-        self.db_manager = DatabaseManager() if cache_enabled else None
+        self.db = DatabaseManager() if cache_enabled else None
     
-    def fetch_data(
-        self,
-        symbol: str,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-        force_refresh: bool = False
-    ) -> pd.DataFrame:
-        """
-        Fetch historical data with automatic fallback.
-        
-        Args:
-            symbol: Stock ticker
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            force_refresh: Skip cache
-            
-        Returns:
-            DataFrame with OHLCV data
-        """
+    def fetch_data(self, symbol, start_date=None, end_date=None, force_refresh=False):
+        """Fetch historical data for a symbol."""
         start_date = start_date or config.DEFAULT_START_DATE
         end_date = end_date or config.DEFAULT_END_DATE
         
         logger.info(f"Fetching {symbol} from {start_date} to {end_date}")
         
-        # Check cache
+        # Try cache first
         if self.cache_enabled and not force_refresh:
-            cached = self._get_from_cache(symbol, start_date, end_date)
+            cached = self._get_cached(symbol, start_date, end_date)
             if cached is not None:
-                logger.info(f"✅ Using cached data for {symbol}")
+                logger.info(f"Using cached data for {symbol}")
                 return cached
         
-        # Try Yahoo Finance unless forced to demo
+        # Try Yahoo Finance
         if not self.force_demo:
             try:
                 import yfinance as yf
@@ -70,50 +45,47 @@ class DataFetcher:
                 df = ticker.history(start=start_date, end=end_date, auto_adjust=True, actions=False)
                 
                 if not df.empty:
-                    df = self._prepare_dataframe(df)
+                    df = self._clean_dataframe(df)
                     if self.cache_enabled:
-                        self.db_manager.save_data(symbol, df)
-                    logger.info(f"✅ Got REAL data for {symbol}")
+                        self.db.save_data(symbol, df)
+                    logger.info(f"Got real data for {symbol}")
                     return df
             except Exception as e:
                 logger.warning(f"Yahoo Finance failed: {e}")
         
-        # Fall back to demo data
-        logger.warning(f"⚠️  Using DEMO DATA for {symbol}")
-        df = self._generate_demo_data(symbol, start_date, end_date)
+        # Use demo data
+        logger.warning(f"Using demo data for {symbol}")
+        df = self._make_demo_data(symbol, start_date, end_date)
         
         if self.cache_enabled:
             try:
-                self.db_manager.save_data(symbol, df)
+                self.db.save_data(symbol, df)
             except:
-                pass  # Don't fail if caching fails
+                pass
         
         return df
     
-    def _generate_demo_data(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-        """Generate realistic demo stock data"""
+    def _make_demo_data(self, symbol, start_date, end_date):
+        """Generate realistic-looking price data."""
+        # Different stocks get different characteristics
         presets = {
             'AAPL': {'price': 150, 'vol': 0.020, 'trend': 0.0005},
             'MSFT': {'price': 350, 'vol': 0.018, 'trend': 0.0006},
             'GOOGL': {'price': 140, 'vol': 0.022, 'trend': 0.0004},
             'TSLA': {'price': 250, 'vol': 0.035, 'trend': 0.0008},
             'SPY': {'price': 450, 'vol': 0.012, 'trend': 0.0004},
-            'AMZN': {'price': 170, 'vol': 0.025, 'trend': 0.0005},
-            'META': {'price': 350, 'vol': 0.028, 'trend': 0.0006},
-            'NVDA': {'price': 500, 'vol': 0.030, 'trend': 0.0010},
-            'JPM': {'price': 160, 'vol': 0.018, 'trend': 0.0003},
-            'V': {'price': 250, 'vol': 0.015, 'trend': 0.0004},
-            'QQQ': {'price': 380, 'vol': 0.015, 'trend': 0.0005},
         }
         
         preset = presets.get(symbol, {'price': 100, 'vol': 0.02, 'trend': 0.0004})
         
         dates = pd.bdate_range(start=start_date, end=end_date)
-        np.random.seed(hash(symbol) % 2**32)
+        np.random.seed(hash(symbol) % 2**32)  # consistent for same symbol
         
+        # Generate price path
         returns = np.random.normal(preset['trend'], preset['vol'], len(dates))
         prices = preset['price'] * np.exp(np.cumsum(returns))
         
+        # Build OHLCV
         data = []
         for date, close in zip(dates, prices):
             rng = close * preset['vol'] * np.random.uniform(0.5, 1.5)
@@ -133,27 +105,26 @@ class DataFetcher:
         logger.info(f"Generated {len(df)} days: ${df['Low'].min():.2f}-${df['High'].max():.2f}")
         return df
     
-    def _get_from_cache(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
-        """Retrieve from cache if available"""
-        if not self.db_manager:
+    def _get_cached(self, symbol, start_date, end_date):
+        if not self.db:
             return None
         
         try:
-            cached_df = self.db_manager.load_data(symbol)
-            if cached_df is None or cached_df.empty:
+            cached = self.db.load_data(symbol)
+            if cached is None or cached.empty:
                 return None
             
             # Check if stale
-            cache_age = (datetime.now() - pd.to_datetime(cached_df.index.max())).days
-            if cache_age > config.CACHE_EXPIRY_DAYS:
+            age = (datetime.now() - pd.to_datetime(cached.index.max())).days
+            if age > config.CACHE_EXPIRY_DAYS:
                 return None
             
-            return cached_df.loc[start_date:end_date]
+            return cached.loc[start_date:end_date]
         except:
             return None
     
-    def _prepare_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Clean dataframe"""
+    def _clean_dataframe(self, df):
+        """Clean up Yahoo Finance response."""
         columns = ['Open', 'High', 'Low', 'Close', 'Volume']
         
         if isinstance(df.columns, pd.MultiIndex):
@@ -171,13 +142,12 @@ class DataFetcher:
         
         return df
     
-    def fetch_multiple(self, symbols: List[str], start_date: Optional[str] = None, 
-                      end_date: Optional[str] = None) -> dict:
-        """Fetch multiple symbols"""
+    def fetch_multiple(self, symbols, start_date=None, end_date=None):
+        """Fetch data for multiple symbols."""
         data = {}
         for symbol in symbols:
             try:
                 data[symbol] = self.fetch_data(symbol, start_date, end_date)
             except Exception as e:
-                logger.error(f"Failed to fetch {symbol}: {e}")
+                logger.error(f"Failed {symbol}: {e}")
         return data
