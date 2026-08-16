@@ -1,107 +1,66 @@
-"""Simple SQLite caching for stock data."""
-
+"""SQLite cache and saved research runs."""
+import json
 import sqlite3
-import pandas as pd
-import logging
 from datetime import datetime
-
+from pathlib import Path
+import pandas as pd
 import config
 
-logger = logging.getLogger(__name__)
-
-
 class DatabaseManager:
-    """Handles SQLite caching."""
-    
     def __init__(self, db_path=config.DATABASE_PATH):
-        self.db_path = db_path
-        self._setup_tables()
-    
-    def _setup_tables(self):
-        """Create tables if needed."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS stock_data (
-                        symbol TEXT,
-                        date TEXT,
-                        open REAL,
-                        high REAL,
-                        low REAL,
-                        close REAL,
-                        volume INTEGER,
-                        PRIMARY KEY (symbol, date)
-                    )
-                """)
-                
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS metadata (
-                        symbol TEXT PRIMARY KEY,
-                        last_updated TEXT,
-                        start_date TEXT,
-                        end_date TEXT
-                    )
-                """)
-                
-                conn.commit()
-                logger.info(f"Database ready at {self.db_path}")
-        except Exception as e:
-            logger.error(f"DB setup failed: {e}")
-    
-    def save_data(self, symbol, df):
-        """Save data to cache."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                # Prepare data
-                data = df.copy()
-                data['symbol'] = symbol
-                data['date'] = data.index.astype(str)
-                data = data.rename(columns={
-                    'Open': 'open', 'High': 'high', 'Low': 'low',
-                    'Close': 'close', 'Volume': 'volume'
-                })
-                
-                # Clear old data for this symbol
-                conn.execute("DELETE FROM stock_data WHERE symbol = ?", (symbol,))
-                
-                # Insert new data
-                data[['symbol', 'date', 'open', 'high', 'low', 'close', 'volume']].to_sql(
-                    'stock_data', conn, if_exists='append', index=False
-                )
-                
-                # Update metadata
-                conn.execute("""
-                    INSERT OR REPLACE INTO metadata (symbol, last_updated, start_date, end_date)
-                    VALUES (?, ?, ?, ?)
-                """, (symbol, str(datetime.now()), str(df.index.min()), str(df.index.max())))
-                
-                conn.commit()
-                logger.info(f"Cached {len(df)} rows for {symbol}")
-        except Exception as e:
-            logger.warning(f"Cache save failed: {e}")
-    
+        self.db_path = str(db_path)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._setup()
+
+    def _connect(self):
+        return sqlite3.connect(self.db_path)
+
+    def _setup(self):
+        with self._connect() as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS stock_data (
+                symbol TEXT NOT NULL, date TEXT NOT NULL, open REAL, high REAL, low REAL, close REAL, volume REAL,
+                source TEXT, fetched_at TEXT, PRIMARY KEY(symbol, date)
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS research_runs (
+                run_id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, symbol TEXT NOT NULL,
+                strategy TEXT NOT NULL, parameters TEXT NOT NULL, start_date TEXT, end_date TEXT,
+                initial_capital REAL, commission REAL, slippage REAL, execution TEXT, position_size REAL,
+                benchmark TEXT, data_source TEXT, metrics TEXT NOT NULL
+            )""")
+            conn.commit()
+
+    def save_data(self, symbol, df, source="unknown"):
+        rows = []
+        fetched_at = datetime.utcnow().isoformat()
+        for idx, row in df.iterrows():
+            rows.append((symbol, pd.Timestamp(idx).isoformat(), float(row.Open), float(row.High), float(row.Low), float(row.Close), float(row.Volume), source, fetched_at))
+        with self._connect() as conn:
+            conn.executemany("""INSERT OR REPLACE INTO stock_data
+                (symbol,date,open,high,low,close,volume,source,fetched_at) VALUES (?,?,?,?,?,?,?,?,?)""", rows)
+            conn.commit()
+
     def load_data(self, symbol):
-        """Load data from cache."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                query = """
-                    SELECT date, open, high, low, close, volume
-                    FROM stock_data
-                    WHERE symbol = ?
-                    ORDER BY date
-                """
-                df = pd.read_sql_query(query, conn, params=(symbol,), parse_dates=['date'], index_col='date')
-                
-                if df.empty:
-                    return None
-                
-                df = df.rename(columns={
-                    'open': 'Open', 'high': 'High', 'low': 'Low',
-                    'close': 'Close', 'volume': 'Volume'
-                })
-                
-                logger.info(f"Loaded {len(df)} rows for {symbol} from cache")
-                return df
-        except Exception as e:
-            logger.warning(f"Cache load failed: {e}")
-            return None
+        with self._connect() as conn:
+            df = pd.read_sql_query("SELECT date,open,high,low,close,volume,source FROM stock_data WHERE symbol=? ORDER BY date", conn, params=(symbol,), parse_dates=["date"])
+        if df.empty:
+            return None, None
+        source = str(df["source"].dropna().iloc[-1]) if df["source"].notna().any() else "unknown"
+        df = df.drop(columns=["source"]).set_index("date")
+        df.columns = ["Open", "High", "Low", "Close", "Volume"]
+        return df, source
+
+    def save_run(self, metadata, metrics):
+        with self._connect() as conn:
+            cur = conn.execute("""INSERT INTO research_runs
+                (created_at,symbol,strategy,parameters,start_date,end_date,initial_capital,commission,slippage,execution,position_size,benchmark,data_source,metrics)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                    datetime.utcnow().isoformat(), metadata["symbol"], metadata["strategy"], json.dumps(metadata.get("parameters", {})),
+                    metadata.get("start_date"), metadata.get("end_date"), metadata.get("initial_capital"), metadata.get("commission"),
+                    metadata.get("slippage"), metadata.get("execution"), metadata.get("position_size"), metadata.get("benchmark"),
+                    metadata.get("data_source"), json.dumps(metrics, default=str)))
+            conn.commit()
+            return cur.lastrowid
+
+    def list_runs(self, limit=50):
+        with self._connect() as conn:
+            return pd.read_sql_query("SELECT * FROM research_runs ORDER BY run_id DESC LIMIT ?", conn, params=(limit,))

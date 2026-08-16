@@ -1,153 +1,95 @@
-"""
-Handles fetching stock data from Yahoo Finance.
-Falls back to simulated data if Yahoo is down/blocking.
-"""
-
-import pandas as pd
-import numpy as np
-from datetime import datetime
-from typing import Optional, List
+"""Free-first market data providers with caching and explicit source reporting."""
+import os
 import logging
-
-import config
+from datetime import datetime
+import pandas as pd
 from .database import DatabaseManager
+from .data_quality import validate_ohlcv
+import config
 
 logger = logging.getLogger(__name__)
 
+class DataFetchError(RuntimeError):
+    pass
 
 class DataFetcher:
-    """Fetches stock data with automatic fallback to demo data."""
-    
-    def __init__(self, cache_enabled=True, force_demo=False):
+    def __init__(self, cache_enabled=True):
         self.cache_enabled = cache_enabled
-        self.force_demo = force_demo
         self.db = DatabaseManager() if cache_enabled else None
-    
-    def fetch_data(self, symbol, start_date=None, end_date=None, force_refresh=False):
-        """Fetch historical data for a symbol."""
+        self.last_source = None
+        self.last_quality = None
+
+    def fetch_data(self, symbol, start_date=None, end_date=None, force_refresh=False, provider="auto"):
+        symbol = symbol.strip().upper()
         start_date = start_date or config.DEFAULT_START_DATE
         end_date = end_date or config.DEFAULT_END_DATE
-        
-        logger.info(f"Fetching {symbol} from {start_date} to {end_date}")
-        
-        # Try cache first
+        if pd.Timestamp(start_date) >= pd.Timestamp(end_date):
+            raise ValueError("Start date must be before end date.")
         if self.cache_enabled and not force_refresh:
-            cached = self._get_cached(symbol, start_date, end_date)
-            if cached is not None:
-                logger.info(f"Using cached data for {symbol}")
-                return cached
-        
-        # Try Yahoo Finance
-        if not self.force_demo:
+            cached, source = self.db.load_data(symbol)
+            if cached is not None and not cached.empty:
+                subset = cached.loc[pd.Timestamp(start_date):pd.Timestamp(end_date)]
+                if len(subset) >= 30:
+                    report = validate_ohlcv(subset)
+                    if report.passed:
+                        self.last_source, self.last_quality = f"Cached {source}", report
+                        return subset
+        providers = [provider] if provider != "auto" else ["yahoo", "alpha_vantage"]
+        errors = []
+        for name in providers:
             try:
-                import yfinance as yf
-                ticker = yf.Ticker(symbol)
-                df = ticker.history(start=start_date, end=end_date, auto_adjust=True, actions=False)
-                
-                if not df.empty:
-                    df = self._clean_dataframe(df)
-                    if self.cache_enabled:
-                        self.db.save_data(symbol, df)
-                    logger.info(f"Got real data for {symbol}")
-                    return df
-            except Exception as e:
-                logger.warning(f"Yahoo Finance failed: {e}")
-        
-        # Use demo data
-        logger.warning(f"Using demo data for {symbol}")
-        df = self._make_demo_data(symbol, start_date, end_date)
-        
-        if self.cache_enabled:
-            try:
-                self.db.save_data(symbol, df)
-            except:
-                pass
-        
-        return df
-    
-    def _make_demo_data(self, symbol, start_date, end_date):
-        """Generate realistic-looking price data."""
-        # Different stocks get different characteristics
-        presets = {
-            'AAPL': {'price': 150, 'vol': 0.020, 'trend': 0.0005},
-            'MSFT': {'price': 350, 'vol': 0.018, 'trend': 0.0006},
-            'GOOGL': {'price': 140, 'vol': 0.022, 'trend': 0.0004},
-            'TSLA': {'price': 250, 'vol': 0.035, 'trend': 0.0008},
-            'SPY': {'price': 450, 'vol': 0.012, 'trend': 0.0004},
-        }
-        
-        preset = presets.get(symbol, {'price': 100, 'vol': 0.02, 'trend': 0.0004})
-        
-        dates = pd.bdate_range(start=start_date, end=end_date)
-        np.random.seed(hash(symbol) % 2**32)  # consistent for same symbol
-        
-        # Generate price path
-        returns = np.random.normal(preset['trend'], preset['vol'], len(dates))
-        prices = preset['price'] * np.exp(np.cumsum(returns))
-        
-        # Build OHLCV
-        data = []
-        for date, close in zip(dates, prices):
-            rng = close * preset['vol'] * np.random.uniform(0.5, 1.5)
-            high = close + rng * np.random.uniform(0, 1)
-            low = close - rng * np.random.uniform(0, 1)
-            open_p = close + rng * np.random.uniform(-0.5, 0.5)
-            
-            data.append({
-                'Open': round(max(open_p, low), 2),
-                'High': round(max(high, close, open_p), 2),
-                'Low': round(min(low, close, open_p), 2),
-                'Close': round(close, 2),
-                'Volume': int(10000000 * np.random.uniform(0.7, 1.3))
-            })
-        
-        df = pd.DataFrame(data, index=dates)
-        logger.info(f"Generated {len(df)} days: ${df['Low'].min():.2f}-${df['High'].max():.2f}")
-        return df
-    
-    def _get_cached(self, symbol, start_date, end_date):
-        if not self.db:
-            return None
-        
-        try:
-            cached = self.db.load_data(symbol)
-            if cached is None or cached.empty:
-                return None
-            
-            # Check if stale
-            age = (datetime.now() - pd.to_datetime(cached.index.max())).days
-            if age > config.CACHE_EXPIRY_DAYS:
-                return None
-            
-            return cached.loc[start_date:end_date]
-        except:
-            return None
-    
-    def _clean_dataframe(self, df):
-        """Clean up Yahoo Finance response."""
-        columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-        
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.droplevel(1)
-        
-        df = df[columns].copy()
-        
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-        
-        df = df.ffill().dropna()
-        
-        for col in columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        return df
-    
-    def fetch_multiple(self, symbols, start_date=None, end_date=None):
-        """Fetch data for multiple symbols."""
-        data = {}
-        for symbol in symbols:
-            try:
-                data[symbol] = self.fetch_data(symbol, start_date, end_date)
-            except Exception as e:
-                logger.error(f"Failed {symbol}: {e}")
-        return data
+                if name == "yahoo":
+                    df = self._fetch_yahoo(symbol, start_date, end_date)
+                elif name == "alpha_vantage":
+                    df = self._fetch_alpha_vantage(symbol, start_date, end_date)
+                else:
+                    raise ValueError(f"Unknown provider: {name}")
+                report = validate_ohlcv(df)
+                if not report.passed:
+                    raise DataFetchError("; ".join(report.errors))
+                self.last_source, self.last_quality = name, report
+                if self.cache_enabled:
+                    self.db.save_data(symbol, df, source=name)
+                return df
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+                logger.warning("%s failed: %s", name, exc)
+        raise DataFetchError("No real market-data provider succeeded. " + " | ".join(errors) + " Configure a provider/API key or try again later. The application does not silently substitute simulated prices.")
+
+    def _fetch_yahoo(self, symbol, start, end):
+        import yfinance as yf
+        df = yf.Ticker(symbol).history(start=start, end=end, auto_adjust=True, actions=False)
+        if df.empty:
+            raise DataFetchError("Yahoo returned no rows.")
+        return self._clean(df)
+
+    def _fetch_alpha_vantage(self, symbol, start, end):
+        key = os.getenv(config.ALPHA_VANTAGE_API_KEY_ENV)
+        if not key:
+            raise DataFetchError("ALPHA_VANTAGE_API_KEY is not configured.")
+        import requests
+        params = {"function": "TIME_SERIES_DAILY_ADJUSTED", "symbol": symbol, "outputsize": "full", "apikey": key}
+        r = requests.get("https://www.alphavantage.co/query", params=params, timeout=20)
+        r.raise_for_status()
+        payload = r.json()
+        series = payload.get("Time Series (Daily)")
+        if not series:
+            raise DataFetchError(payload.get("Note") or payload.get("Information") or "Alpha Vantage returned no daily series.")
+        rows = []
+        for date, values in series.items():
+            rows.append({"Date": date, "Open": values.get("1. open"), "High": values.get("2. high"), "Low": values.get("3. low"), "Close": values.get("5. adjusted close", values.get("4. close")), "Volume": values.get("6. volume", values.get("5. volume", 0))})
+        df = pd.DataFrame(rows).set_index("Date")
+        df.index = pd.to_datetime(df.index)
+        df = df.loc[pd.Timestamp(start):pd.Timestamp(end)]
+        if df.empty:
+            raise DataFetchError("Alpha Vantage returned no rows in the requested range.")
+        return self._clean(df)
+
+    @staticmethod
+    def _clean(df):
+        x = df.copy()
+        if isinstance(x.columns, pd.MultiIndex):
+            x.columns = x.columns.get_level_values(0)
+        x.index = pd.to_datetime(x.index).tz_localize(None) if getattr(x.index, "tz", None) is not None else pd.to_datetime(x.index)
+        x = x[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce").sort_index()
+        return x.dropna()

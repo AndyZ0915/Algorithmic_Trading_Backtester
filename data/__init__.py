@@ -1,4 +1,4 @@
-"""Data layer for fetching and caching market data."""
-from .data_fetcher import DataFetcher
+from .data_fetcher import DataFetcher, DataFetchError
 from .database import DatabaseManager
-__all__ = ['DataFetcher', 'DatabaseManager']
+from .data_quality import validate_ohlcv, DataQualityReport
+from .news import NewsFetcher

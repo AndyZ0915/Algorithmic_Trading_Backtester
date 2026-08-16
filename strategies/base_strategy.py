@@ -1,52 +1,23 @@
-"""Base class for trading strategies."""
-
+"""Strategy interfaces. Strategies emit desired position changes, not executions."""
 from abc import ABC, abstractmethod
 import pandas as pd
-from typing import Dict, Any
-
 
 class BaseStrategy(ABC):
-    """All strategies inherit from this."""
-    
-    def __init__(self, name, **params):
-        self.name = name
-        self.params = params
-    
-    def _validate_params(self):
-        """Override this to add parameter validation."""
-        pass
-    
+    name = "Base Strategy"
+    def __init__(self, **params): self.params = params
     @abstractmethod
-    def generate_signals(self, data):
-        """
-        Main method - returns data with 'signal' column added.
-        1 = buy, -1 = sell, 0 = hold
-        """
-        pass
-    
-    def calculate_indicators(self, data):
-        """Optional: calculate indicators before generating signals."""
-        return data.copy()
-    
-    def get_parameters(self):
-        return self.params.copy()
-    
-    def __str__(self):
-        params_str = ', '.join(f"{k}={v}" for k, v in self.params.items())
-        return f"{self.name}({params_str})"
-    
-    def __repr__(self):
-        return self.__str__()
-
+    def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame: ...
+    def calculate_indicators(self, data): return data.copy()
+    def validate_data(self, data):
+        if data is None or data.empty: raise ValueError("Strategy received no data.")
+        required = {"Open", "High", "Low", "Close", "Volume"}
+        missing = required - set(data.columns)
+        if missing: raise ValueError(f"Missing columns: {sorted(missing)}")
 
 class BuyAndHoldStrategy(BaseStrategy):
-    """Simple buy-and-hold benchmark."""
-    
-    def __init__(self):
-        super().__init__(name="Buy and Hold")
-    
+    name = "Buy & Hold"
     def generate_signals(self, data):
-        df = data.copy()
-        df['signal'] = 0
-        df.loc[df.index[0], 'signal'] = 1  # buy on day 1
+        self.validate_data(data)
+        df = data.copy(); df["signal"] = 0
+        if len(df): df.iloc[0, df.columns.get_loc("signal")] = 1
         return df
