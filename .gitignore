@@ -1,34 +1,6 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-dist/
-*.egg-info/
-venv/
-.venv/
-ENV/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*~
-.DS_Store
-
-# Database
+.env
 *.db
-*.sqlite
-
-# Data
-*.csv
-data/raw/
-output/
-
-# Logs
-*.log
-
-# Streamlit
-.streamlit/
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/

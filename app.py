@@ -1,215 +1,113 @@
-"""
-Trading Backtester - Streamlit UI
-Run with: streamlit run app.py
-"""
-
-import streamlit as st
+"""Quant Research Platform v3.0: analysis, calculations and visual research only."""
 import pandas as pd
-import plotly.graph_objects as go
-from datetime import datetime
-
+import streamlit as st
+from dotenv import load_dotenv
+load_dotenv()
 import config
-from data import DataFetcher
-from strategies import (
-    MovingAverageCrossover, RSIStrategy, MACDStrategy,
-    BollingerBandsStrategy, MeanReversionStrategy
-)
-from backtester import Backtester
+from data import DataFetcher, NewsFetcher
+from backtester import Backtester, historical_forward_returns, technical_condition_table
+from strategies import MovingAverageCrossover, RSIStrategy, MACDStrategy, BollingerBandsStrategy, MeanReversionStrategy
 from visualization import charts
+from portfolio_analysis import build_portfolio, portfolio_stats
 
-# Page setup
-st.set_page_config(
-    page_title=config.APP_TITLE,
-    page_icon=config.APP_ICON,
-    layout="wide"
-)
+st.set_page_config(page_title=config.APP_TITLE,page_icon=config.APP_ICON,layout="wide")
+st.title(f"{config.APP_ICON} {config.APP_TITLE}")
+st.caption("Quantitative market research, backtesting, risk analysis and interactive visuals. No AI and no live trading.")
 
-# Title
-st.markdown(f'<h1 style="text-align: center;">{config.APP_ICON} {config.APP_TITLE}</h1>', 
-            unsafe_allow_html=True)
-st.markdown("### Test trading strategies on historical data")
+with st.sidebar:
+    st.header("Research Setup")
+    symbol=st.text_input("Symbol","AAPL").strip().upper()
+    start=st.date_input("Start",pd.Timestamp(config.DEFAULT_START_DATE).date())
+    end=st.date_input("End",pd.Timestamp(config.DEFAULT_END_DATE).date())
+    capital=st.number_input("Initial capital",1000.0,10_000_000.0,float(config.DEFAULT_INITIAL_CAPITAL),step=1000.0)
+    commission=st.number_input("Commission",0.0,0.05,config.DEFAULT_COMMISSION,step=0.0001,format="%.4f")
+    slippage=st.number_input("Slippage",0.0,0.05,config.DEFAULT_SLIPPAGE,step=0.0001,format="%.4f")
+    position_size=st.slider("Position size (% equity)",1,100,100)/100
+    execution=st.selectbox("Execution",["next_open","next_close","same_close"],format_func=lambda x:{"next_open":"Next Open (recommended)","next_close":"Next Close","same_close":"Same Close (idealized)"}[x])
+    benchmark=st.text_input("Benchmark",config.DEFAULT_BENCHMARK).strip().upper()
+    strategy_name=st.selectbox("Strategy",["MA Crossover","RSI Strategy","MACD Strategy","Bollinger Bands","Mean Reversion"])
+    if strategy_name=="MA Crossover":
+        a=st.slider("Fast MA",2,150,50); b=st.slider("Slow MA",10,400,200); strategy=MovingAverageCrossover(a,b)
+    elif strategy_name=="RSI Strategy":
+        p=st.slider("RSI period",5,50,14); ob=st.slider("Overbought",55,95,70); os_=st.slider("Oversold",5,45,30); strategy=RSIStrategy(p,ob,os_)
+    elif strategy_name=="MACD Strategy":
+        f=st.slider("Fast",2,30,12); s=st.slider("Slow",5,60,26); sig=st.slider("Signal",2,30,9); strategy=MACDStrategy(f,s,sig)
+    elif strategy_name=="Bollinger Bands":
+        p=st.slider("Period",5,100,20); ns=st.slider("Std dev",0.5,4.0,2.0,0.1); strategy=BollingerBandsStrategy(p,ns)
+    else:
+        lb=st.slider("Lookback",5,100,20); ent=st.slider("Entry z-score",0.5,4.0,2.0,0.1); ex=st.slider("Exit z-score",0.0,2.0,0.5,0.1); strategy=MeanReversionStrategy(lb,ent,ex)
+    force=st.checkbox("Force refresh market data")
+    run=st.button("Run Research",type="primary",use_container_width=True)
 
-# Sidebar config
-st.sidebar.header("Configuration")
-
-symbol = st.sidebar.text_input("Symbol", "AAPL").upper()
-
-col1, col2 = st.sidebar.columns(2)
-start_date = col1.date_input("Start", pd.to_datetime(config.DEFAULT_START_DATE))
-end_date = col2.date_input("End", pd.to_datetime(config.DEFAULT_END_DATE))
-
-capital = st.sidebar.number_input(
-    "Initial Capital ($)",
-    min_value=1000,
-    max_value=1000000,
-    value=int(config.DEFAULT_INITIAL_CAPITAL),
-    step=1000
-)
-
-# Strategy selection
-st.sidebar.header("Strategy")
-strategy_type = st.sidebar.selectbox(
-    "Choose Strategy",
-    ["Moving Average Crossover", "RSI Strategy", "MACD Strategy", 
-     "Bollinger Bands", "Mean Reversion"]
-)
-
-st.sidebar.subheader("Parameters")
-
-# Build strategy based on selection
-if strategy_type == "Moving Average Crossover":
-    short = st.sidebar.slider("Short MA", 10, 100, 50)
-    long = st.sidebar.slider("Long MA", 100, 300, 200)
-    strategy = MovingAverageCrossover(short_window=short, long_window=long)
-
-elif strategy_type == "RSI Strategy":
-    period = st.sidebar.slider("Period", 5, 30, 14)
-    overbought = st.sidebar.slider("Overbought", 60, 90, 70)
-    oversold = st.sidebar.slider("Oversold", 10, 40, 30)
-    strategy = RSIStrategy(period=period, overbought=overbought, oversold=oversold)
-
-elif strategy_type == "MACD Strategy":
-    fast = st.sidebar.slider("Fast", 5, 20, 12)
-    slow = st.sidebar.slider("Slow", 20, 40, 26)
-    signal = st.sidebar.slider("Signal", 5, 15, 9)
-    strategy = MACDStrategy(fast_period=fast, slow_period=slow, signal_period=signal)
-
-elif strategy_type == "Bollinger Bands":
-    period = st.sidebar.slider("Period", 10, 50, 20)
-    std = st.sidebar.slider("Std Dev", 1.0, 3.0, 2.0, 0.5)
-    strategy = BollingerBandsStrategy(period=period, num_std=std)
-
-else:  # Mean Reversion
-    lookback = st.sidebar.slider("Lookback", 10, 50, 20)
-    threshold = st.sidebar.slider("Threshold", 1.0, 3.0, 2.0, 0.1)
-    strategy = MeanReversionStrategy(lookback_period=lookback, entry_threshold=threshold)
-
-# Run button
-run = st.sidebar.button("Run Backtest", type="primary", use_container_width=True)
-
-st.sidebar.info("Using demo data (Yahoo Finance has been unreliable lately)")
-
-# Main area
+if "result" not in st.session_state: st.session_state.result=None
 if run:
-    with st.spinner(f"Running backtest for {symbol}..."):
+    try:
+        fetcher=DataFetcher(); data=fetcher.fetch_data(symbol,str(start),str(end),force_refresh=force)
+        bt=Backtester(symbol,str(start),str(end),capital,commission,slippage,execution,position_size,benchmark,data,fetcher.last_source)
+        result=bt.run(strategy); st.session_state.result=(result,data,fetcher.last_quality,fetcher.last_source)
+    except Exception as e:
+        st.error(str(e)); st.stop()
+
+if st.session_state.result is None:
+    st.info("Configure a research run in the sidebar and click Run Research.")
+    st.markdown("### Current focus")
+    st.write("Reliable data, explicit execution assumptions, realistic costs, technical indicators, historical signal analysis, portfolio calculations, risk statistics, news context and interactive visualizations. There is no AI layer in this version.")
+    st.stop()
+
+result,data,report,source=st.session_state.result
+m=result.metrics
+enriched=result.signals
+
+tabs=st.tabs(["Overview","Technical","Historical Signals","Risk","Trades","Portfolio","News","Data Quality"])
+with tabs[0]:
+    c=st.columns(6)
+    for col,label,value in zip(c,["Return","CAGR","Sharpe","Sortino","Max Drawdown","Trades"],[f"{m.total_return:.2f}%",f"{m.annualized_return:.2f}%",f"{m.sharpe_ratio:.2f}",f"{m.sortino_ratio:.2f}",f"{m.max_drawdown:.2f}%",str(m.num_trades)]): col.metric(label,value)
+    st.plotly_chart(charts.equity_chart(result.equity_curve,data.Close,f"{strategy.name}: Strategy vs {benchmark}"),use_container_width=True)
+    st.plotly_chart(charts.drawdown_chart(result.equity_curve),use_container_width=True)
+    st.plotly_chart(charts.monthly_heatmap(result.equity_curve),use_container_width=True)
+    st.subheader("Research assumptions")
+    st.json({"symbol":symbol,"strategy":strategy.name,"parameters":strategy.params,"execution":execution,"initial_capital":capital,"commission":commission,"slippage":slippage,"position_size":position_size,"benchmark":benchmark,"data_source":source})
+with tabs[1]:
+    st.plotly_chart(charts.price_chart(enriched),use_container_width=True)
+    st.dataframe(enriched.tail(150),use_container_width=True)
+with tabs[2]:
+    st.info("Historical signal analysis describes what happened after similar conditions in this dataset. It is not a forecast or investment recommendation.")
+    condition=technical_condition_table(enriched,strategy.name)
+    stats=historical_forward_returns(enriched,condition)
+    st.metric("Matching historical observations",int(condition.sum()))
+    st.dataframe(stats,use_container_width=True)
+    st.bar_chart(stats.set_index("horizon_days")["average_return_pct"])
+with tabs[3]:
+    a,b,c,d=st.columns(4); a.metric("Volatility",f"{m.volatility:.2f}%"); b.metric("Calmar",f"{m.calmar_ratio:.2f}"); c.metric("DD duration",f"{m.max_drawdown_duration} days"); d.metric("Worst trade",f"${m.worst_trade:,.2f}")
+    st.plotly_chart(charts.rolling_chart(result.equity_curve),use_container_width=True)
+with tabs[4]:
+    a,b,c=st.columns(3); a.metric("Win rate",f"{m.win_rate:.1f}%"); b.metric("Profit factor",("∞" if m.profit_factor==float("inf") else f"{m.profit_factor:.2f}")); c.metric("Avg holding",f"{m.avg_holding_days:.1f} days")
+    st.plotly_chart(charts.trade_distribution(result.trades),use_container_width=True)
+    st.dataframe(result.trades,use_container_width=True)
+    st.download_button("Download trade CSV",result.trades.to_csv(index=False),f"{symbol}_trades.csv","text/csv")
+with tabs[5]:
+    st.subheader("Simple fixed-weight portfolio analysis")
+    tickers=st.text_input("Tickers",f"{symbol},MSFT,SPY").upper().replace(" ","").split(",")
+    weights_text=st.text_input("Weights (%)", "50,25,25")
+    if st.button("Analyze Portfolio"):
         try:
-            # Run backtest
-            bt = Backtester(
-                symbol=symbol,
-                start_date=start_date.strftime('%Y-%m-%d'),
-                end_date=end_date.strftime('%Y-%m-%d'),
-                initial_capital=capital
-            )
-            
-            results = bt.run(strategy)
-            
-            st.success(f"Backtest complete for {symbol}")
-            
-            # Top metrics
-            st.header("Performance")
-            col1, col2, col3, col4 = st.columns(4)
-            
-            col1.metric("Total Return", f"{results.total_return:.2f}%")
-            col2.metric("Sharpe Ratio", f"{results.sharpe_ratio:.2f}")
-            col3.metric("Max Drawdown", f"{results.max_drawdown:.2f}%")
-            col4.metric("Win Rate", f"{results.win_rate:.1f}%")
-            
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Trades", results.num_trades)
-            col2.metric("Annual Return", f"{results.annualized_return:.2f}%")
-            col3.metric("Profit Factor", f"{results.profit_factor:.2f}")
-            
-            # Charts
-            st.header("Charts")
-            
-            st.subheader("Equity Curve")
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=results.equity_curve.index,
-                y=results.equity_curve['equity'],
-                name='Strategy',
-                line=dict(color=config.COLOR_SCHEME['equity'], width=2)
-            ))
-            
-            # Add buy & hold
-            benchmark = bt.data['Close']
-            norm = (benchmark / benchmark.iloc[0]) * capital
-            fig.add_trace(go.Scatter(
-                x=norm.index,
-                y=norm.values,
-                name='Buy & Hold',
-                line=dict(color=config.COLOR_SCHEME['benchmark'], width=2, dash='dash')
-            ))
-            
-            fig.update_layout(
-                xaxis_title="Date",
-                yaxis_title="Value ($)",
-                height=500,
-                hovermode='x unified'
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Drawdown
-            st.subheader("Drawdown")
-            equity = results.equity_curve['equity']
-            cummax = equity.expanding().max()
-            dd = (equity - cummax) / cummax * 100
-            
-            fig_dd = go.Figure()
-            fig_dd.add_trace(go.Scatter(
-                x=dd.index,
-                y=dd.values,
-                fill='tozeroy',
-                name='Drawdown',
-                line=dict(color=config.COLOR_SCHEME['negative'])
-            ))
-            fig_dd.update_layout(
-                xaxis_title="Date",
-                yaxis_title="Drawdown (%)",
-                height=400
-            )
-            st.plotly_chart(fig_dd, use_container_width=True)
-            
-            # Trades table
-            if not results.trades.empty:
-                st.header("Trade Log")
-                trades = results.trades.copy()
-                trades['entry_date'] = pd.to_datetime(trades['entry_date']).dt.strftime('%Y-%m-%d')
-                trades['exit_date'] = pd.to_datetime(trades['exit_date']).dt.strftime('%Y-%m-%d')
-                st.dataframe(trades, use_container_width=True)
-                
-                csv = trades.to_csv(index=False)
-                st.download_button(
-                    "Download CSV",
-                    csv,
-                    f"{symbol}_trades.csv",
-                    "text/csv"
-                )
-            
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
-            st.exception(e)
-
-else:
-    # Welcome
-    st.info("Configure your backtest in the sidebar and click Run")
-    
-    st.markdown("""
-    ### How to use
-    
-    1. Enter a stock symbol
-    2. Set date range
-    3. Choose a strategy
-    4. Adjust parameters
-    5. Run the backtest
-    
-    ### Strategies
-    - **MA Crossover** - Golden cross/death cross
-    - **RSI** - Overbought/oversold
-    - **MACD** - Signal line crossovers  
-    - **Bollinger Bands** - Mean reversion
-    - **Mean Reversion** - Z-score based
-    """)
-
-st.markdown("---")
-st.markdown("<div style='text-align: center; color: #666;'>v1.0.0</div>", unsafe_allow_html=True)
+            weights=[float(x)/100 for x in weights_text.split(",")]
+            if len(weights)!=len(tickers) or abs(sum(weights)-1)>0.001: raise ValueError("Weights must match tickers and sum to 100%.")
+            pf=DataFetcher(); price_map={t:pf.fetch_data(t,str(start),str(end))["Close"] for t in tickers}; aligned,norm,equity=build_portfolio(price_map,dict(zip(tickers,weights))); ps=portfolio_stats(equity)
+            cols=st.columns(4); cols[0].metric("Return",f"{ps['total_return_pct']:.2f}%"); cols[1].metric("Volatility",f"{ps['annualized_volatility_pct']:.2f}%"); cols[2].metric("Sharpe",f"{ps['sharpe']:.2f}"); cols[3].metric("Drawdown",f"{ps['max_drawdown_pct']:.2f}%")
+            st.line_chart(equity)
+            st.dataframe(norm.tail(100),use_container_width=True)
+        except Exception as e: st.error(str(e))
+with tabs[6]:
+    st.caption("News is contextual market information. No AI-generated summaries or recommendations are used.")
+    try:
+        news=NewsFetcher().search(symbol,20)
+        if news.empty: st.info("No public RSS results returned.")
+        for _,row in news.iterrows():
+            st.markdown(f"**{row.title}**  \n{row.published}  \n{row.summary[:500]}  \n[Source]({row.link})")
+    except Exception as e: st.warning(f"News unavailable: {e}")
+with tabs[7]:
+    st.metric("Status",report.status)
+    st.write({"rows":report.rows,"coverage":f"{report.start} to {report.end}","missing_values":report.missing_values,"duplicate_dates":report.duplicate_dates,"suspicious_returns":report.suspicious_returns,"source":source})
+    for x in report.errors: st.error(x)
+    for x in report.warnings: st.warning(x)
